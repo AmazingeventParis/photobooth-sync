@@ -121,7 +121,10 @@ def list_all_folders():
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         ).execute()
-        return jsonify({"folders": res.get("files", [])})
+        # Filtrer : ne garder que les dossiers qui contiennent un numero FA (anciens clients ignores)
+        all_folders = res.get("files", [])
+        filtered = [f for f in all_folders if "FA" in (f.get("name") or "").upper()]
+        return jsonify({"folders": filtered, "ignored_count": len(all_folders) - len(filtered)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
