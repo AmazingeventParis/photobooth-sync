@@ -7,11 +7,15 @@ et insere les lignes dans Supabase appshoot_photos.
 import os
 import io
 import json
+import re
 import subprocess
 import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
+
+# Regex pour matcher un vrai numero de commande (FA + 4-6 chiffres)
+FA_REGEX = re.compile(r"FA\d{4,6}", re.IGNORECASE)
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -121,9 +125,9 @@ def list_all_folders():
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         ).execute()
-        # Filtrer : ne garder que les dossiers qui contiennent un numero FA (anciens clients ignores)
+        # Filtrer : ne garder que les dossiers qui contiennent un vrai num_id FA12345 (anciens clients ignores)
         all_folders = res.get("files", [])
-        filtered = [f for f in all_folders if "FA" in (f.get("name") or "").upper()]
+        filtered = [f for f in all_folders if FA_REGEX.search(f.get("name") or "")]
         return jsonify({"folders": filtered, "ignored_count": len(all_folders) - len(filtered)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
