@@ -7,6 +7,8 @@ et insere les lignes dans Supabase appshoot_photos.
 import os
 import io
 import json
+import subprocess
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -264,15 +266,16 @@ def run_import(job_id):
                 break
         j["total"] = len(files)
 
-        # 2) Recuperer ce qui est deja importe (par drive_id dans l'URL)
-        existing_ids = set()
+        # 2) Recuperer ce qui est deja importe + savoir si thumbnail manquant
+        # existing_map[drive_id] = {"id": uuid, "photo_url": ..., "thumbnail_url": ..., "photo_type": ...}
+        existing_map = {}
         try:
             resp = requests.get(
                 f"{SUPABASE_URL}/rest/v1/appshoot_photos",
                 params={
                     "event_code": f"eq.{event_code}",
                     "photo_type": "in.(photobooth,video)",
-                    "select":     "photo_url",
+                    "select":     "id,photo_url,thumbnail_url,photo_type",
                 },
                 headers=_supa_headers(),
                 timeout=30,
@@ -282,10 +285,9 @@ def run_import(job_id):
                     url = row.get("photo_url") or ""
                     if "/photobooth/" in url:
                         name = url.rsplit("/", 1)[-1]
-                        # extension à virer + suffixe _thumb potentiel
                         drive_id = name.split(".")[0].replace("_thumb", "")
                         if drive_id:
-                            existing_ids.add(drive_id)
+                            existing_map[drive_id] = row
         except Exception as e:
             j["errors"].append(f"existing check: {e}")
 
@@ -294,14 +296,38 @@ def run_import(job_id):
             j["current"] = f.get("name")
             drive_id = f["id"]
             try:
-                if drive_id in existing_ids:
-                    j["skipped"] += 1
-                    continue
-
                 mime = f["mimeType"]
                 is_image = mime.startswith("image/")
                 is_video = mime.startswith("video/")
                 if not (is_image or is_video):
+                    j["skipped"] += 1
+                    continue
+
+                # Deja importe : on regen le thumb video si manquant, sinon skip
+                if drive_id in existing_map:
+                    row = existing_map[drive_id]
+                    if is_video and not row.get("thumbnail_url"):
+                        try:
+                            req = d.files().get_media(fileId=drive_id, supportsAllDrives=True)
+                            buf = io.BytesIO()
+                            downloader = MediaIoBaseDownload(buf, req, chunksize=1024 * 1024 * 4)
+                            done = False
+                            while not done:
+                                _, done = downloader.next_chunk()
+                            video_data = buf.getvalue()
+                            thumb_url = _generate_video_thumb(video_data, event_code, drive_id, s3)
+                            if thumb_url:
+                                requests.patch(
+                                    f"{SUPABASE_URL}/rest/v1/appshoot_photos",
+                                    params={"id": f"eq.{row['id']}"},
+                                    json={"thumbnail_url": thumb_url},
+                                    headers={**_supa_headers(), "Content-Type": "application/json"},
+                                    timeout=30,
+                                )
+                                j["imported"] += 1
+                                continue
+                        except Exception as e:
+                            j["errors"].append(f"thumb regen {f['name']}: {str(e)[:200]}")
                     j["skipped"] += 1
                     continue
 
@@ -337,7 +363,7 @@ def run_import(job_id):
                     except Exception:
                         pass  # on garde l'original
 
-                # Thumbnail JPEG 400px (pour images non-animees uniquement)
+                # Thumbnail JPEG 400px
                 thumb_url = None
                 if is_image and mime != "image/gif":
                     try:
@@ -357,6 +383,11 @@ def run_import(job_id):
                         thumb_url = f"https://{S3_PUBLIC_HOST}/{thumb_key}"
                     except Exception as e:
                         j["errors"].append(f"thumb {drive_id}: {e}")
+                elif is_video:
+                    try:
+                        thumb_url = _generate_video_thumb(data, event_code, drive_id, s3)
+                    except Exception as e:
+                        j["errors"].append(f"video thumb {drive_id}: {e}")
 
                 # Upload main
                 key = f"Myshootnbox/{event_code}/photobooth/{drive_id}.{ext}"
@@ -403,6 +434,42 @@ def run_import(job_id):
     finally:
         j["current"] = None
         j["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _generate_video_thumb(video_bytes: bytes, event_code: str, drive_id: str, s3) -> str | None:
+    """Extrait le 1er frame d'une video via ffmpeg, l'upload sur S3 et retourne l'URL."""
+    with tempfile.TemporaryDirectory() as td:
+        in_path = os.path.join(td, f"in_{drive_id}.bin")
+        out_path = os.path.join(td, f"thumb_{drive_id}.jpg")
+        with open(in_path, "wb") as f:
+            f.write(video_bytes)
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", in_path,
+                    "-vf", "thumbnail,scale=800:-1",
+                    "-frames:v", "1",
+                    "-q:v", "5",
+                    out_path,
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        if not os.path.exists(out_path):
+            return None
+        with open(out_path, "rb") as f:
+            thumb_bytes = f.read()
+    thumb_key = f"Myshootnbox/{event_code}/photobooth/{drive_id}_thumb.jpg"
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=thumb_key,
+        Body=thumb_bytes,
+        ContentType="image/jpeg",
+        ACL="public-read",
+    )
+    return f"https://{S3_PUBLIC_HOST}/{thumb_key}"
 
 
 def _supa_headers():
