@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -20,6 +21,8 @@ import requests
 from PIL import Image
 
 app = Flask(__name__)
+# Autoriser les appels depuis shootnbox.fr et tous les domaines en local pour debug
+CORS(app, resources={r"/*": {"origins": "*", "allow_headers": ["Content-Type", "X-Admin-Password"]}})
 
 # ------------------------------------------------------------------
 # Configuration via variables d'environnement
