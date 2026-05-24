@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -484,6 +485,216 @@ def _supa_headers():
         "apikey":        SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
     }
+
+
+# ------------------------------------------------------------------
+# DRIVE SCAN — boucle de fond qui scanne Drive toutes les 10 min
+# et met a jour drive_photo_count + drive_count_stable_since dans Supabase
+# pour gater les boutons "Importer" / "Envoyer" dans admin-app
+# ------------------------------------------------------------------
+SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "600"))  # 10 min default
+SCAN_STATS = {
+    "last_run_at":     None,
+    "last_run_status": "never_run",
+    "events_scanned":  0,
+    "events_changed":  0,
+    "events_stable":   0,
+    "events_no_folder": 0,
+    "errors":          [],
+    "duration_sec":    0,
+}
+SCAN_LOCK = threading.Lock()
+
+
+def _count_drive_files(folder_id):
+    """Compte les fichiers media (image/video) dans un dossier Drive."""
+    d = drive_client()
+    count = 0
+    page_token = None
+    while True:
+        res = d.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="nextPageToken,files(id,mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        for f in res.get("files", []):
+            m = f.get("mimeType", "")
+            if m.startswith("image/") or m.startswith("video/"):
+                count += 1
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return count
+
+
+def _find_drive_folder_by_num_id(num_id):
+    """Cherche le dossier Drive contenant num_id dans son nom. Retourne le plus recent ou None."""
+    if not num_id or not DRIVE_PARENT_FOLDER:
+        return None
+    try:
+        res = drive_client().files().list(
+            q=f"'{DRIVE_PARENT_FOLDER}' in parents and trashed=false "
+              f"and mimeType='application/vnd.google-apps.folder' "
+              f"and name contains '{num_id}'",
+            fields="files(id,name,createdTime)",
+            pageSize=10,
+            orderBy="createdTime desc",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        folders = res.get("files", [])
+        if not folders:
+            return None
+        # Filtre strict : le nom doit contenir le num_id complet (pas un prefix qui matche par hasard)
+        exact = [f for f in folders if num_id.upper() in (f.get("name") or "").upper()]
+        return exact[0] if exact else None
+    except Exception:
+        return None
+
+
+def scan_drive_for_all_events():
+    """Scan Drive pour tous les events Supabase concernes et update les colonnes.
+
+    Concerne uniquement les events ou review_status est 'idle' ou 'pending'
+    (= pas encore "Envoye"). Les events deja envoyes ne sont plus scannes.
+    """
+    started = time.time()
+    stats = {
+        "events_scanned": 0,
+        "events_changed": 0,
+        "events_stable":  0,
+        "events_no_folder": 0,
+        "errors":         [],
+    }
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/appshoot_events",
+            params={
+                "select":        "event_code,num_id,drive_photo_count,drive_count_stable_since",
+                "review_status": "in.(idle,pending)",
+                "order":         "event_date.desc",
+            },
+            headers=_supa_headers(),
+            timeout=30,
+        )
+        if r.status_code != 200:
+            stats["errors"].append(f"supabase fetch events: HTTP {r.status_code}")
+            return _save_scan_stats(stats, started, "fetch_failed")
+        events = r.json()
+
+        for e in events:
+            num_id     = (e.get("num_id") or "").strip()
+            event_code = (e.get("event_code") or "").strip()
+            if not num_id or not event_code:
+                continue
+            stats["events_scanned"] += 1
+
+            try:
+                folder = _find_drive_folder_by_num_id(num_id)
+                if folder is None:
+                    new_count = 0
+                else:
+                    new_count = _count_drive_files(folder["id"])
+            except Exception as ex:
+                stats["errors"].append(f"{num_id}: scan {str(ex)[:120]}")
+                continue
+
+            old_count = e.get("drive_photo_count") or 0
+            old_stable = e.get("drive_count_stable_since")
+
+            # Cas 1 : aucune photo en Drive
+            if new_count == 0:
+                if old_count != 0 or old_stable is not None:
+                    _update_event_drive_state(event_code, 0, None)
+                stats["events_no_folder"] += 1
+                continue
+
+            # Cas 2 : count change -> reset stable_since
+            if new_count != old_count:
+                _update_event_drive_state(event_code, new_count, datetime.now(timezone.utc).isoformat())
+                stats["events_changed"] += 1
+                continue
+
+            # Cas 3 : count identique
+            # Si stable_since etait null (= 1er scan stable), on l'initialise maintenant.
+            # Sinon on touche a rien (la stabilite s'accumule au fil des scans).
+            if old_stable is None:
+                _update_event_drive_state(event_code, new_count, datetime.now(timezone.utc).isoformat())
+                stats["events_changed"] += 1
+            else:
+                stats["events_stable"] += 1
+
+        return _save_scan_stats(stats, started, "ok")
+
+    except Exception as ex:
+        stats["errors"].append(f"FATAL: {str(ex)[:300]}")
+        return _save_scan_stats(stats, started, "fatal_error")
+
+
+def _update_event_drive_state(event_code, count, stable_since):
+    payload = {"drive_photo_count": count, "drive_count_stable_since": stable_since}
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/appshoot_events",
+            params={"event_code": f"eq.{event_code}"},
+            json=payload,
+            headers={**_supa_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            timeout=15,
+        )
+    except Exception:
+        pass  # log silencieux, le prochain scan re-tentera
+
+
+def _save_scan_stats(stats, started, status):
+    duration = round(time.time() - started, 2)
+    with SCAN_LOCK:
+        SCAN_STATS["last_run_at"]      = datetime.now(timezone.utc).isoformat()
+        SCAN_STATS["last_run_status"]  = status
+        SCAN_STATS["events_scanned"]   = stats["events_scanned"]
+        SCAN_STATS["events_changed"]   = stats["events_changed"]
+        SCAN_STATS["events_stable"]    = stats["events_stable"]
+        SCAN_STATS["events_no_folder"] = stats["events_no_folder"]
+        SCAN_STATS["errors"]           = stats["errors"][-20:]
+        SCAN_STATS["duration_sec"]     = duration
+    return SCAN_STATS
+
+
+def scan_loop():
+    """Thread daemon qui scanne Drive toutes les SCAN_INTERVAL_SEC."""
+    # Delai au boot pour laisser Flask demarrer
+    time.sleep(30)
+    while True:
+        try:
+            scan_drive_for_all_events()
+        except Exception:
+            pass
+        time.sleep(SCAN_INTERVAL_SEC)
+
+
+@app.route("/api/drive_scan", methods=["GET", "POST"])
+def manual_drive_scan():
+    """Declenche un scan manuel (debug)."""
+    if not auth_ok():
+        return jsonify({"error": "unauthorized"}), 401
+    s = scan_drive_for_all_events()
+    return jsonify(s)
+
+
+@app.route("/api/drive_scan/stats")
+def drive_scan_stats():
+    """Renvoie les stats du dernier scan automatique."""
+    if not auth_ok():
+        return jsonify({"error": "unauthorized"}), 401
+    with SCAN_LOCK:
+        return jsonify(dict(SCAN_STATS))
+
+
+# Demarre le thread de scan au load du module (= au boot gunicorn)
+_scan_thread = threading.Thread(target=scan_loop, daemon=True, name="drive-scan-loop")
+_scan_thread.start()
 
 
 # ------------------------------------------------------------------
