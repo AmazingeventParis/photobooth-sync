@@ -245,6 +245,29 @@ def list_jobs():
 # ------------------------------------------------------------------
 # Worker
 # ------------------------------------------------------------------
+def _build_drive_fresh():
+    """Construit un client Drive frais (pas de cache). Evite les corruptions SSL persistantes
+    quand un client global a vu une connexion brisee."""
+    if not SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("GOOGLE_SA_KEY env var missing")
+    info = json.loads(SERVICE_ACCOUNT_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _build_s3_fresh():
+    """Construit un client S3 frais (pas de cache)."""
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_KEY,
+        aws_secret_access_key=S3_SECRET,
+        region_name=S3_REGION,
+    )
+
+
 def run_import(job_id):
     with JOBS_LOCK:
         j = JOBS[job_id]
@@ -253,8 +276,11 @@ def run_import(job_id):
     folder_id  = j["folder_id"]
 
     try:
-        d = drive_client()
-        s3 = s3_client()
+        # On construit des clients FRAIS par job pour eviter les corruptions SSL
+        # qui surviennent quand un client global est partage et qu'une connexion
+        # precedente s'est terminee brutalement (cf "record layer failure").
+        d = _build_drive_fresh()
+        s3 = _build_s3_fresh()
 
         # 1) Lister tous les fichiers du dossier Drive
         files, page_token = [], None
