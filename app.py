@@ -569,6 +569,8 @@ def scan_drive_for_all_events():
         "events_no_folder": 0,
         "errors":         [],
     }
+    auto_import_queue = []  # (event_code, folder_id) — lance APRES le scan
+    save_result = None
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/appshoot_events",
@@ -626,41 +628,49 @@ def scan_drive_for_all_events():
                 stats["events_changed"] += 1
             else:
                 stats["events_stable"] += 1
-                # AUTO-IMPORT : si l'event est stable depuis >= 20 min ET pas encore importe,
-                # on kick run_import en background. Le mail+push reste manuel (bouton Envoyer).
-                try:
-                    _maybe_auto_import(event_code, folder["id"], old_stable)
-                except Exception as ex:
-                    stats["errors"].append(f"{event_code} auto-import: {str(ex)[:120]}")
+                # AUTO-IMPORT : collecte dans une liste pour lancement DIFFÉRÉ apres le scan,
+                # pour eviter le partage de client SSL avec scan_loop (provoque "record layer failure")
+                if _should_queue_auto_import(event_code, old_stable):
+                    auto_import_queue.append((event_code, folder["id"]))
 
-        return _save_scan_stats(stats, started, "ok")
+        save_result = _save_scan_stats(stats, started, "ok")
 
     except Exception as ex:
         stats["errors"].append(f"FATAL: {str(ex)[:300]}")
-        return _save_scan_stats(stats, started, "fatal_error")
+        save_result = _save_scan_stats(stats, started, "fatal_error")
+
+    # === Apres le scan : lance les auto-imports SEQUENTIELLEMENT (1 thread a la fois)
+    # avec un petit delai entre chaque pour eviter la collision SSL Google API
+    for event_code, folder_id in auto_import_queue:
+        try:
+            _launch_auto_import_job(event_code, folder_id)
+            time.sleep(2)  # petit delai entre 2 starts
+        except Exception:
+            pass
+
+    return save_result
 
 
-def _maybe_auto_import(event_code, folder_id, stable_since_iso):
-    """Si l'event est stable >= 20 min ET aucune photo deja importee ET aucun job en cours,
-    on kick run_import automatiquement."""
-    # 1) Verifier la stabilite >= 20 min
+def _should_queue_auto_import(event_code, stable_since_iso):
+    """Verifie si on doit queuer un auto-import pour cet event."""
+    # 1) Stabilite >= 20 min
     if not stable_since_iso:
-        return
+        return False
     try:
         stable_dt = datetime.fromisoformat(stable_since_iso.replace("Z", "+00:00"))
     except Exception:
-        return
+        return False
     stable_min = (datetime.now(timezone.utc) - stable_dt).total_seconds() / 60.0
     if stable_min < 20:
-        return
+        return False
 
-    # 2) Verifier qu'aucun job d'import n'est en cours/queued pour cet event
+    # 2) Aucun job d'import en cours/queued pour cet event
     with JOBS_LOCK:
         for j in JOBS.values():
             if j.get("event_code") == event_code and j.get("status") in ("queued", "running"):
-                return  # deja en cours, skip
+                return False
 
-    # 3) Verifier qu'aucune photo n'a deja ete importee pour cet event (count = 0)
+    # 3) Aucune photo deja importee
     try:
         r = requests.head(
             f"{SUPABASE_URL}/rest/v1/appshoot_photos",
@@ -672,11 +682,14 @@ def _maybe_auto_import(event_code, folder_id, stable_since_iso):
         if "/" in cr:
             total = int(cr.split("/")[-1])
             if total > 0:
-                return  # deja importe
+                return False
     except Exception:
-        return  # en cas de doute, on ne fait rien
+        return False
+    return True
 
-    # 4) Tout bon : creer un job et lancer l'import en thread
+
+def _launch_auto_import_job(event_code, folder_id):
+    """Cree un job et lance run_import en thread (a appeler APRES le scan_loop)."""
     job_id = str(uuid.uuid4())
     with JOBS_LOCK:
         JOBS[job_id] = {
@@ -691,7 +704,7 @@ def _maybe_auto_import(event_code, folder_id, stable_since_iso):
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
             "current":    None,
-            "auto":       True,  # marqueur : c'est un import automatique
+            "auto":       True,
         }
     threading.Thread(target=run_import, args=(job_id,), daemon=True).start()
 
