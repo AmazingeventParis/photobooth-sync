@@ -635,6 +635,10 @@ def scan_drive_for_all_events():
 
         return _save_scan_stats(stats, started, "ok")
 
+    except Exception as ex:
+        stats["errors"].append(f"FATAL: {str(ex)[:300]}")
+        return _save_scan_stats(stats, started, "fatal_error")
+
 
 def _maybe_auto_import(event_code, folder_id, stable_since_iso):
     """Si l'event est stable >= 20 min ET aucune photo deja importee ET aucun job en cours,
@@ -690,10 +694,6 @@ def _maybe_auto_import(event_code, folder_id, stable_since_iso):
             "auto":       True,  # marqueur : c'est un import automatique
         }
     threading.Thread(target=run_import, args=(job_id,), daemon=True).start()
-
-    except Exception as ex:
-        stats["errors"].append(f"FATAL: {str(ex)[:300]}")
-        return _save_scan_stats(stats, started, "fatal_error")
 
 
 def _update_event_drive_state(event_code, count, stable_since):
