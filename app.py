@@ -626,8 +626,70 @@ def scan_drive_for_all_events():
                 stats["events_changed"] += 1
             else:
                 stats["events_stable"] += 1
+                # AUTO-IMPORT : si l'event est stable depuis >= 20 min ET pas encore importe,
+                # on kick run_import en background. Le mail+push reste manuel (bouton Envoyer).
+                try:
+                    _maybe_auto_import(event_code, folder["id"], old_stable)
+                except Exception as ex:
+                    stats["errors"].append(f"{event_code} auto-import: {str(ex)[:120]}")
 
         return _save_scan_stats(stats, started, "ok")
+
+
+def _maybe_auto_import(event_code, folder_id, stable_since_iso):
+    """Si l'event est stable >= 20 min ET aucune photo deja importee ET aucun job en cours,
+    on kick run_import automatiquement."""
+    # 1) Verifier la stabilite >= 20 min
+    if not stable_since_iso:
+        return
+    try:
+        stable_dt = datetime.fromisoformat(stable_since_iso.replace("Z", "+00:00"))
+    except Exception:
+        return
+    stable_min = (datetime.now(timezone.utc) - stable_dt).total_seconds() / 60.0
+    if stable_min < 20:
+        return
+
+    # 2) Verifier qu'aucun job d'import n'est en cours/queued pour cet event
+    with JOBS_LOCK:
+        for j in JOBS.values():
+            if j.get("event_code") == event_code and j.get("status") in ("queued", "running"):
+                return  # deja en cours, skip
+
+    # 3) Verifier qu'aucune photo n'a deja ete importee pour cet event (count = 0)
+    try:
+        r = requests.head(
+            f"{SUPABASE_URL}/rest/v1/appshoot_photos",
+            params={"event_code": f"eq.{event_code}", "photo_type": "in.(photobooth,video)"},
+            headers={**_supa_headers(), "Prefer": "count=exact"},
+            timeout=10,
+        )
+        cr = r.headers.get("Content-Range", "")
+        if "/" in cr:
+            total = int(cr.split("/")[-1])
+            if total > 0:
+                return  # deja importe
+    except Exception:
+        return  # en cas de doute, on ne fait rien
+
+    # 4) Tout bon : creer un job et lancer l'import en thread
+    job_id = str(uuid.uuid4())
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "job_id":     job_id,
+            "status":     "queued",
+            "event_code": event_code,
+            "folder_id":  folder_id,
+            "total":      0,
+            "imported":   0,
+            "skipped":    0,
+            "errors":     [],
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "current":    None,
+            "auto":       True,  # marqueur : c'est un import automatique
+        }
+    threading.Thread(target=run_import, args=(job_id,), daemon=True).start()
 
     except Exception as ex:
         stats["errors"].append(f"FATAL: {str(ex)[:300]}")
