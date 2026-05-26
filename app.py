@@ -683,6 +683,41 @@ def manual_drive_scan():
     return jsonify(s)
 
 
+@app.route("/api/wipe_event_photobooth", methods=["POST"])
+def wipe_event_photobooth():
+    """Supprime tous les fichiers S3 dans Myshootnbox/{event_code}/photobooth/ (+ thumbs).
+    Utile quand on a importe un mauvais dossier Drive et qu'on veut tout nettoyer.
+    Le caller doit aussi nettoyer Supabase appshoot_photos en amont."""
+    if not auth_ok():
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    event_code = (data.get("event_code") or request.args.get("event_code") or "").strip()
+    if not event_code:
+        return jsonify({"error": "event_code required"}), 400
+
+    s3 = s3_client()
+    prefix = f"Myshootnbox/{event_code}/photobooth/"
+    deleted = 0
+    errors = []
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        keys_to_delete = []
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                keys_to_delete.append({"Key": obj["Key"]})
+        # boto3 batch delete : max 1000 par appel
+        while keys_to_delete:
+            batch = keys_to_delete[:1000]
+            keys_to_delete = keys_to_delete[1000:]
+            resp = s3.delete_objects(Bucket=S3_BUCKET, Delete={"Objects": batch, "Quiet": True})
+            deleted += len(batch)
+            for err in resp.get("Errors", []) or []:
+                errors.append(err)
+        return jsonify({"ok": True, "event_code": event_code, "prefix": prefix, "deleted": deleted, "errors": errors})
+    except Exception as ex:
+        return jsonify({"ok": False, "error": str(ex), "deleted": deleted}), 500
+
+
 @app.route("/api/drive_scan/stats")
 def drive_scan_stats():
     """Renvoie les stats du dernier scan automatique."""
