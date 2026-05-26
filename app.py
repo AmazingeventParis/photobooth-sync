@@ -683,6 +683,29 @@ def manual_drive_scan():
     return jsonify(s)
 
 
+@app.route("/api/list_event_s3", methods=["GET"])
+def list_event_s3():
+    """Liste tous les objets S3 pour un event_code (debug)."""
+    if not auth_ok():
+        return jsonify({"error": "unauthorized"}), 401
+    event_code = (request.args.get("event_code") or "").strip()
+    if not event_code:
+        return jsonify({"error": "event_code required"}), 400
+    s3 = s3_client()
+    out = {"bucket": S3_BUCKET, "prefixes_tried": [], "items": []}
+    for prefix in [f"Myshootnbox/{event_code}/", f"Mysmakk/{event_code}/"]:
+        out["prefixes_tried"].append(prefix)
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    out["items"].append({"key": obj["Key"], "size": obj.get("Size", 0)})
+        except Exception as ex:
+            out["error_" + prefix] = str(ex)[:200]
+    out["total"] = len(out["items"])
+    return jsonify(out)
+
+
 @app.route("/api/wipe_event_photobooth", methods=["POST"])
 def wipe_event_photobooth():
     """Supprime tous les fichiers S3 dans Myshootnbox/{event_code}/photobooth/ (+ thumbs).
