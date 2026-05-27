@@ -468,6 +468,49 @@ def run_import(job_id):
     finally:
         j["current"] = None
         j["finished_at"] = datetime.now(timezone.utc).isoformat()
+        # Met a jour le compteur photo_count dans appshoot_events (= nombre reel de
+        # photos+videos dans appshoot_photos pour cet event). Permet a l'admin et
+        # aux exports d'avoir une stat fiable sans recalculer cote client.
+        try:
+            _update_event_photo_count(event_code)
+        except Exception as ex:
+            j["errors"].append(f"update photo_count: {str(ex)[:200]}")
+
+
+def _update_event_photo_count(event_code: str):
+    """Recompte les photos+videos dans appshoot_photos pour cet event_code et
+    met a jour appshoot_events.photo_count.
+    """
+    if not event_code:
+        return
+    # Compte exact via Prefer: count=exact + HEAD
+    r = requests.head(
+        f"{SUPABASE_URL}/rest/v1/appshoot_photos",
+        params={
+            "event_code": f"eq.{event_code}",
+            "photo_type": "in.(photobooth,video)",
+            "select":     "id",
+        },
+        headers={**_supa_headers(), "Prefer": "count=exact"},
+        timeout=30,
+    )
+    count = 0
+    cr = r.headers.get("content-range") or r.headers.get("Content-Range") or ""
+    if "/" in cr:
+        try:
+            count = int(cr.rsplit("/", 1)[1])
+        except Exception:
+            count = 0
+    # PATCH appshoot_events.photo_count
+    requests.patch(
+        f"{SUPABASE_URL}/rest/v1/appshoot_events",
+        params={"event_code": f"eq.{event_code}"},
+        json={"photo_count": count},
+        headers={**_supa_headers(),
+                 "Content-Type": "application/json",
+                 "Prefer": "return=minimal"},
+        timeout=30,
+    )
 
 
 def _generate_video_thumb(video_bytes: bytes, event_code: str, drive_id: str, s3) -> str | None:
