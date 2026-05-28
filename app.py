@@ -894,6 +894,61 @@ def drive_scan_stats():
         return jsonify(dict(SCAN_STATS))
 
 
+@app.route("/api/debug_drive_match", methods=["GET"])
+def debug_drive_match():
+    """Diagnostic : pourquoi un num_id ne matche pas un dossier Drive.
+    Compare la requete SCOPED (dans le parent) vs GLOBALE (tout le Drive)."""
+    if not auth_ok():
+        return jsonify({"error": "unauthorized"}), 401
+    num_id = (request.args.get("num_id") or "").strip()
+    if not num_id:
+        return jsonify({"error": "num_id required"}), 400
+
+    out = {"num_id": num_id, "drive_parent_folder": DRIVE_PARENT_FOLDER}
+    d = _build_drive_fresh()
+
+    # 1) Requete SCOPED (= celle du scanner) : dossiers dans le parent contenant num_id
+    try:
+        res = d.files().list(
+            q=f"'{DRIVE_PARENT_FOLDER}' in parents and trashed=false "
+              f"and mimeType='application/vnd.google-apps.folder' "
+              f"and name contains '{num_id}'",
+            fields="files(id,name,createdTime,parents)",
+            pageSize=20, orderBy="createdTime desc",
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
+        out["scoped_query"] = res.get("files", [])
+    except Exception as ex:
+        out["scoped_query_error"] = str(ex)[:300]
+
+    # 2) Requete GLOBALE : dossiers PARTOUT contenant num_id (peu importe le parent)
+    try:
+        res = d.files().list(
+            q=f"trashed=false and mimeType='application/vnd.google-apps.folder' "
+              f"and name contains '{num_id}'",
+            fields="files(id,name,createdTime,parents)",
+            pageSize=20, orderBy="createdTime desc",
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
+        out["global_query"] = res.get("files", [])
+    except Exception as ex:
+        out["global_query_error"] = str(ex)[:300]
+
+    # 3) Pour chaque dossier trouve (global), compter ses fichiers media
+    out["folder_file_counts"] = {}
+    for f in (out.get("global_query") or []):
+        try:
+            out["folder_file_counts"][f["id"]] = {
+                "name": f.get("name"),
+                "parents": f.get("parents"),
+                "media_count": _count_drive_files(f["id"]),
+            }
+        except Exception as ex:
+            out["folder_file_counts"][f["id"]] = {"error": str(ex)[:200]}
+
+    return jsonify(out)
+
+
 # Demarre le thread de scan au load du module (= au boot gunicorn)
 _scan_thread = threading.Thread(target=scan_loop, daemon=True, name="drive-scan-loop")
 _scan_thread.start()
