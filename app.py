@@ -144,7 +144,8 @@ def search_folder():
     try:
         # Recherche GLOBALE (peu importe le parent) : les dossiers clients peuvent etre
         # ranges dans des dossiers d'archive differents selon l'annee.
-        res = drive_client().files().list(
+        # Client FRAIS pour eviter la corruption SSL du client cache.
+        res = _build_drive_fresh().files().list(
             q=f"trashed=false "
               f"and mimeType='application/vnd.google-apps.folder' "
               f"and name contains '{num_id}'",
@@ -580,9 +581,10 @@ SCAN_STATS = {
 SCAN_LOCK = threading.Lock()
 
 
-def _count_drive_files(folder_id):
-    """Compte les fichiers media (image/video) dans un dossier Drive."""
-    d = drive_client()
+def _count_drive_files(folder_id, drive=None):
+    """Compte les fichiers media (image/video) dans un dossier Drive.
+    drive : client Drive a reutiliser (frais de preference). Si None, fallback cache."""
+    d = drive or drive_client()
     count = 0
     page_token = None
     while True:
@@ -604,18 +606,21 @@ def _count_drive_files(folder_id):
     return count
 
 
-def _find_drive_folder_by_num_id(num_id):
+def _find_drive_folder_by_num_id(num_id, drive=None):
     """Cherche le dossier Drive contenant num_id dans son nom, PARTOUT dans le Drive
     (peu importe le dossier parent). Retourne le plus recent ou None.
 
     On ne scope plus a DRIVE_PARENT_FOLDER : les dossiers clients peuvent etre ranges
     dans des sous-dossiers / dossiers d'archive differents selon l'annee. Tant que le
     nom contient le num_id exact (ex: FA13961), on le retrouve.
+
+    drive : client Drive a reutiliser (frais de preference). Si None, fallback cache.
     """
     if not num_id:
         return None
+    d = drive or drive_client()
     try:
-        res = drive_client().files().list(
+        res = d.files().list(
             q=f"trashed=false "
               f"and mimeType='application/vnd.google-apps.folder' "
               f"and name contains '{num_id}'",
@@ -651,6 +656,10 @@ def scan_drive_for_all_events():
     }
     auto_import_queue = []  # (event_code, folder_id) — lance APRES le scan
     save_result = None
+    # Client Drive FRAIS pour tout le scan (evite la corruption SSL du client cache
+    # global, cf "record layer failure"). Un seul client pour tout le run = OK car
+    # le scan tourne dans un thread unique.
+    scan_drive = _build_drive_fresh()
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/appshoot_events",
@@ -675,11 +684,11 @@ def scan_drive_for_all_events():
             stats["events_scanned"] += 1
 
             try:
-                folder = _find_drive_folder_by_num_id(num_id)
+                folder = _find_drive_folder_by_num_id(num_id, drive=scan_drive)
                 if folder is None:
                     new_count = 0
                 else:
-                    new_count = _count_drive_files(folder["id"])
+                    new_count = _count_drive_files(folder["id"], drive=scan_drive)
             except Exception as ex:
                 stats["errors"].append(f"{num_id}: scan {str(ex)[:120]}")
                 continue
