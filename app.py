@@ -142,16 +142,21 @@ def search_folder():
     if not num_id:
         return jsonify({"error": "num_id required"}), 400
     try:
+        # Recherche GLOBALE (peu importe le parent) : les dossiers clients peuvent etre
+        # ranges dans des dossiers d'archive differents selon l'annee.
         res = drive_client().files().list(
-            q=f"'{DRIVE_PARENT_FOLDER}' in parents and trashed=false "
+            q=f"trashed=false "
               f"and mimeType='application/vnd.google-apps.folder' "
               f"and name contains '{num_id}'",
             fields="files(id,name,createdTime)",
             pageSize=20,
+            orderBy="createdTime desc",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         ).execute()
-        return jsonify({"folders": res.get("files", [])})
+        # Filtre strict : le nom doit contenir le num_id complet
+        folders = [f for f in res.get("files", []) if num_id.upper() in (f.get("name") or "").upper()]
+        return jsonify({"folders": folders})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -600,16 +605,22 @@ def _count_drive_files(folder_id):
 
 
 def _find_drive_folder_by_num_id(num_id):
-    """Cherche le dossier Drive contenant num_id dans son nom. Retourne le plus recent ou None."""
-    if not num_id or not DRIVE_PARENT_FOLDER:
+    """Cherche le dossier Drive contenant num_id dans son nom, PARTOUT dans le Drive
+    (peu importe le dossier parent). Retourne le plus recent ou None.
+
+    On ne scope plus a DRIVE_PARENT_FOLDER : les dossiers clients peuvent etre ranges
+    dans des sous-dossiers / dossiers d'archive differents selon l'annee. Tant que le
+    nom contient le num_id exact (ex: FA13961), on le retrouve.
+    """
+    if not num_id:
         return None
     try:
         res = drive_client().files().list(
-            q=f"'{DRIVE_PARENT_FOLDER}' in parents and trashed=false "
+            q=f"trashed=false "
               f"and mimeType='application/vnd.google-apps.folder' "
               f"and name contains '{num_id}'",
             fields="files(id,name,createdTime)",
-            pageSize=10,
+            pageSize=20,
             orderBy="createdTime desc",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
